@@ -1,0 +1,150 @@
+!pip install mediapipe
+
+import cv2
+import time
+import os # 處理檔案路徑，用於檢查模型是否已存在 (已移至上方)
+import numpy as np
+import urllib.request
+import mediapipe as mp
+from google.colab.patches import cv2_imshow # Colab 專用的顯示函式
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# --- 步驟 1: 設定與模型下載 (MediaPipe) ---
+
+# 設置模型檔案名稱
+POSE_LANDMARKER_MODEL = 'pose_landmarker_full.task'
+# 修正 URL：使用更穩定且通用的 Google Cloud Storage 路徑
+MODEL_URL = 'https://storage.googleapis.com/mediapipe-files/' + POSE_LANDMARKER_MODEL
+
+# 下載模型（如果尚未存在）
+try:
+    if not os.path.exists(POSE_LANDMARKER_MODEL):
+        print(f"📥 正在下載 MediaPipe 姿勢地標模型: {POSE_LANDMARKER_MODEL}...")
+        # 增加超時時間以應對較慢的下載速度
+        urllib.request.urlretrieve(MODEL_URL, POSE_LANDMARKER_MODEL, timeout=30)
+        print("✅ 模型下載完成。")
+except Exception as e:
+    print(f"❌ 模型下載失敗: {e}")
+    # 如果下載失敗，可能是網路問題或路徑再次變動
+    print("請檢查您的網路連線，或確認模型路徑是否仍然有效。")
+    exit()
+
+# 步驟 2: 初始化 MediaPipe 姿勢地標器 (Pose Landmarker)
+# 將 running_mode 設為 VIDEO 才能在連續的幀中處理並進行追蹤。
+BaseOptions = mp.tasks.BaseOptions
+PoseLandmarker = mp.tasks.vision.PoseLandmarker
+PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+options = PoseLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=POSE_LANDMARKER_MODEL),
+    running_mode=VisionRunningMode.VIDEO,
+    # 設置追蹤人數上限
+    num_poses=5
+)
+
+# 使用 with 語句確保 Landmarker 資源被正確釋放 (在 Colab 互動環境中，通常直接創建即可)
+landmarker = PoseLandmarker.create_from_options(options)
+
+# 設置輸入和輸出路徑 (假設影片已經上傳到 Colab 根目錄)
+video_path = "v4.mp4"
+output_path = "v4_mediapipe_output.mp4"
+
+cap = cv2.VideoCapture(video_path)
+
+if not cap.isOpened():
+    print(f"❌ 影片讀取失敗，請確認檔案 {video_path} 已上傳。")
+    exit()
+
+# 獲取影片的原始資訊
+fps = cap.get(cv2.CAP_PROP_FPS)
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+# 獲取總幀數 (用於 timeStampMs 計算)
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+# 步驟 3: 初始化影片寫入器 (VideoWriter)
+# 使用 mp4v 編碼，確保多數播放器都能播放
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+print(f"✅ 影片寫入器初始化成功，目標 FPS: {fps:.2f}")
+
+# MediaPipe 繪圖工具
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
+# 設定繪製樣式
+drawing_styles = mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
+
+frame_count = 0
+start_time = time.time()
+
+while True:
+    ret, frame = cap.read()
+
+    if not ret:
+        break
+
+    # 計算 MediaPipe 要求的 timeStampMs (以毫秒為單位)
+    # 這是 MediaPipe 進行影片模式追蹤所必需的
+    timestamp_ms = int((frame_count * 1000) / fps)
+
+    # 步驟 4: 轉換格式並進行偵測與追蹤
+    # OpenCV 讀取為 BGR，MediaPipe 要求 RGB
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.RGB, data=rgb_frame)
+
+    # 執行偵測和追蹤
+    detection_result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+    # 步驟 5: 繪製結果 (姿勢骨架和人物計數 ID)
+    if detection_result.pose_landmarks:
+        for idx, landmarks in enumerate(detection_result.pose_landmarks):
+            # 1. 繪製姿勢骨架 (MediaPipe 的主要輸出)
+            mp_drawing.draw_landmarks(
+                frame,
+                landmarks,
+                mp_pose.POSE_CONNECTIONS,
+                drawing_styles,
+                drawing_styles
+            )
+
+            # 2. 標註人物 ID (使用當前幀中的偵測順序作為 ID)
+            # 注意: 此 ID (idx) 是每一幀中偵測到的順序，而非像 ByteTrack 那樣的持續性追蹤 ID。
+            # MediaPipe 在 VIDEO 模式下會盡力維持個體追蹤，但不會在結果中明確提供 track_id 欄位。
+
+            # 找出近似的 Bounding Box 頂點 (從所有地標中計算 min/max 座標)
+            # 由於地標座標是歸一化的 (0到1)，需要乘上寬高來得到像素值
+            x_min = min([lm.x * width for lm in landmarks])
+            y_min = min([lm.y * height for lm in landmarks])
+
+            # 在頭部上方標註 ID
+            cv2.putText(
+                frame,
+                f"Person ID: {idx + 1}",
+                (int(x_min), int(y_min) - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
+
+    # 將處理後的幀寫入新的影片檔案
+    out.write(frame)
+    frame_count += 1
+
+# 步驟 6: 釋放資源並計算總 FPS
+cap.release()
+out.release()
+# 關閉 Landmarker 釋放模型資源
+landmarker.close()
+
+end_time = time.time()
+total_time = end_time - start_time
+actual_fps = frame_count / total_time
+
+print(f"🏁 影片處理完成！總幀數: {frame_count}")
+print(f"總耗時: {total_time:.2f} 秒")
+print(f"平均處理 FPS: {actual_fps:.2f} FPS")
+print(f"✅ 處理後的影片已儲存為 {output_path}，請下載檔案！")
