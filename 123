@@ -1,0 +1,98 @@
+import cv2
+import torch
+import time
+from ultralytics import YOLO
+
+# 載入 YOLOv8 模型 (使用最小的 nano 版本)
+model = YOLO('yolov8n.pt')
+
+# 強制丟到 GPU (如果有的話)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+print(f"✅ 使用的裝置: {device}")
+
+# 讀取影片檔
+video_path = "C:\\Users\\lisa4\\vsvideo\\v4.mp4" # 請確認您的路徑正確
+cap = cv2.VideoCapture(video_path)
+
+if not cap.isOpened():
+    print("❌ 影片讀取失敗，請確認檔案名稱或路徑正確")
+    exit()
+
+# 獲取影片原始 FPS 和解析度
+original_fps = cap.get(cv2.CAP_PROP_FPS)
+print(f"🎬 影片原始 FPS: {original_fps:.2f}")
+
+# 設定模型推理的輸入影像尺寸（可調整！這是提高速度的關鍵）
+# 預設為 640，您可以嘗試更小的值，例如 320 或 480
+INFERENCE_IMG_SIZE = 640
+print(f"📏 模型輸入尺寸: {INFERENCE_IMG_SIZE}x{INFERENCE_IMG_SIZE}")
+
+
+paused = False
+window_name = "YOLOv8 Object Tracking"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+while True:
+    start_time = time.time()  # 記錄每幀開始時間
+
+    if not paused:
+        ret, frame = cap.read()
+        if not ret:
+            # 影片播放結束
+            print("🎥 影片播放結束")
+            break
+            
+        # 核心運算：進行目標追蹤
+        # 加入 imgsz 參數來控制推理速度
+        results = model.track(frame, 
+                              classes=[0], # 僅追蹤 'person'
+                              tracker='bytetrack.yaml', 
+                              conf=0.6,
+                              imgsz=INFERENCE_IMG_SIZE)
+
+        # 畫框 (使用 result.boxes 資訊手動繪製)
+        for result in results:
+            if result.boxes.id is not None:
+                boxes = result.boxes.xyxy.cpu().numpy().astype(int)
+                track_ids = result.boxes.id.cpu().numpy().astype(int)
+                
+                for box, track_id in zip(boxes, track_ids):
+                    x1, y1, x2, y2 = box
+                    # 綠色框線
+                    color = (0, 255, 0)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    # ---------------- 計算並印出 FPS ----------------
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    # 實際處理速度 (Processing FPS)
+    processing_fps = 1 / elapsed_time
+    
+    # 在畫面左上方顯示處理速度 (紅色)
+    cv2.putText(frame, f"Proc FPS: {processing_fps:.2f}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    
+    # 顯示原始影片目標 FPS (藍色)
+    cv2.putText(frame, f"Orig FPS: {original_fps:.2f}", (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+    # ------------------------------------------------
+
+    cv2.imshow(window_name, frame)
+
+    # **播放邏輯優化：**
+    # 這裡將 delay 設為 1，表示盡可能快地刷新畫面 (只等 1ms)。
+    # 這樣影片播放速度就等於您的 'Proc FPS'，避免了卡頓感。
+    key = cv2.waitKey(15 if not paused else 0) & 0xFF 
+    
+    if key == ord(' '): # 按空白鍵暫停/繼續
+        paused = not paused
+    if key == ord('q'): # 按 'q' 鍵退出
+        break
+
+
+cap.release()
+cv2.destroyAllWindows()
+print("程式執行結束，資源已釋放。")
