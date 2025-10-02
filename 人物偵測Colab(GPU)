@@ -1,150 +1,163 @@
-!pip install mediapipe
+# =========================================================
+# 步驟 1: 安裝、導入與檔案上傳
+# =========================================================
+print("--- 步驟 1/3: 設置環境與上傳檔案 ---")
+!pip install ultralytics -qq
+!pip install opencv-python -qq
 
+# 導入所有必要的模組
+from google.colab import files
 import cv2
+import torch
 import time
-import os # 處理檔案路徑，用於檢查模型是否已存在 (已移至上方)
-import numpy as np
-import urllib.request
-import mediapipe as mp
-from google.colab.patches import cv2_imshow # Colab 專用的顯示函式
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+from ultralytics import YOLO
+import os
+import sys
 
-# --- 步驟 1: 設定與模型下載 (MediaPipe) ---
-
-# 設置模型檔案名稱
-POSE_LANDMARKER_MODEL = 'pose_landmarker_full.task'
-# 修正 URL：使用更穩定且通用的 Google Cloud Storage 路徑
-MODEL_URL = 'https://storage.googleapis.com/mediapipe-files/' + POSE_LANDMARKER_MODEL
-
-# 下載模型（如果尚未存在）
+# --- 檔案上傳與路徑設定 ---
+print("請上傳您的影片檔案 (建議使用 MP4 格式)。程式將等待您完成上傳...")
 try:
-    if not os.path.exists(POSE_LANDMARKER_MODEL):
-        print(f"📥 正在下載 MediaPipe 姿勢地標模型: {POSE_LANDMARKER_MODEL}...")
-        # 增加超時時間以應對較慢的下載速度
-        urllib.request.urlretrieve(MODEL_URL, POSE_LANDMARKER_MODEL, timeout=30)
-        print("✅ 模型下載完成。")
+    # 執行 Colab 檔案上傳功能
+    uploaded = files.upload()
+
+    if not uploaded:
+        print("❌ 未偵測到檔案上傳。程式結束。")
+        sys.exit()
+
+    # 取得上傳的檔案名稱
+    video_filename = list(uploaded.keys())[0]
+    video_path = f"/content/{video_filename}"
+    output_path = "output_tracked_video.mp4"
+
 except Exception as e:
-    print(f"❌ 模型下載失敗: {e}")
-    # 如果下載失敗，可能是網路問題或路徑再次變動
-    print("請檢查您的網路連線，或確認模型路徑是否仍然有效。")
-    exit()
+    print(f"❌ 檔案上傳失敗：{e}")
+    sys.exit()
 
-# 步驟 2: 初始化 MediaPipe 姿勢地標器 (Pose Landmarker)
-# 將 running_mode 設為 VIDEO 才能在連續的幀中處理並進行追蹤。
-BaseOptions = mp.tasks.BaseOptions
-PoseLandmarker = mp.tasks.vision.PoseLandmarker
-PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
+print(f"✅ 檔案 '{video_filename}' 上傳成功，開始設定模型。")
 
-options = PoseLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=POSE_LANDMARKER_MODEL),
-    running_mode=VisionRunningMode.VIDEO,
-    # 設置追蹤人數上限
-    num_poses=5
-)
 
-# 使用 with 語句確保 Landmarker 資源被正確釋放 (在 Colab 互動環境中，通常直接創建即可)
-landmarker = PoseLandmarker.create_from_options(options)
+# --- 模型與硬體設定 ---
+model = YOLO('yolov8n.pt')
 
-# 設置輸入和輸出路徑 (假設影片已經上傳到 Colab 根目錄)
-video_path = "v4.mp4"
-output_path = "v4_mediapipe_output.mp4"
+# 設置裝置
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+print(f"✅ 使用的裝置: {device}")
 
+# 模型輸入尺寸
+INFERENCE_IMG_SIZE = 320
+print(f"📏 模型輸入尺寸: {INFERENCE_IMG_SIZE}x{INFERENCE_IMG_SIZE}")
+
+
+# =========================================================
+# 步驟 2: YOLOv8 影片處理迴圈 (只保留 Process FPS)
+# =========================================================
+print("\n--- 步驟 2/3: 影片處理與追蹤 (無即時畫面) ---")
+
+# 讀取影片檔
 cap = cv2.VideoCapture(video_path)
 
 if not cap.isOpened():
-    print(f"❌ 影片讀取失敗，請確認檔案 {video_path} 已上傳。")
-    exit()
+    print("❌ 影片讀取失敗。")
+    sys.exit()
 
-# 獲取影片的原始資訊
-fps = cap.get(cv2.CAP_PROP_FPS)
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-# 獲取總幀數 (用於 timeStampMs 計算)
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# 獲取影片屬性
+original_fps = cap.get(cv2.CAP_PROP_FPS)
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-# 步驟 3: 初始化影片寫入器 (VideoWriter)
-# 使用 mp4v 編碼，確保多數播放器都能播放
+# 影片輸出設置
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+out = cv2.VideoWriter(output_path, fourcc, original_fps, (frame_width, frame_height))
 
-print(f"✅ 影片寫入器初始化成功，目標 FPS: {fps:.2f}")
+if not out.isOpened():
+    print("❌ 警告：影片寫入器開啟失敗，輸出檔案可能無法正確生成。")
 
-# MediaPipe 繪圖工具
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
-# 設定繪製樣式
-drawing_styles = mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
-
+# 初始化用於計算 FPS 的變數
+prev_time = time.time()
 frame_count = 0
-start_time = time.time()
+total_start_time = time.time()
+processing_fps = 0.0
+
+print("⏳ 開始高速處理影片...")
 
 while True:
+
+    current_time = time.time()
     ret, frame = cap.read()
 
     if not ret:
-        break
+        break # 影片播放結束
 
-    # 計算 MediaPipe 要求的 timeStampMs (以毫秒為單位)
-    # 這是 MediaPipe 進行影片模式追蹤所必需的
-    timestamp_ms = int((frame_count * 1000) / fps)
+    # --- 執行 YOLOv8 追蹤 (無 inference_time 測量) ---
+    results = model.track(frame,
+                          classes=[0],
+                          tracker='bytetrack.yaml',
+                          conf=0.6,
+                          imgsz=INFERENCE_IMG_SIZE,
+                          verbose=False)
 
-    # 步驟 4: 轉換格式並進行偵測與追蹤
-    # OpenCV 讀取為 BGR，MediaPipe 要求 RGB
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.RGB, data=rgb_frame)
+    # --- 計算 Process FPS (整體處理速度) ---
+    elapsed_time = current_time - prev_time
+    processing_fps = 1 / elapsed_time if elapsed_time > 0 else 0
+    prev_time = current_time
 
-    # 執行偵測和追蹤
-    detection_result = landmarker.detect_for_video(mp_image, timestamp_ms)
+    # --- 畫框 ---
+    for result in results:
+        if result.boxes.id is not None:
+            boxes = result.boxes.xyxy.cpu().numpy().astype(int)
+            track_ids = result.boxes.id.cpu().numpy().astype(int)
 
-    # 步驟 5: 繪製結果 (姿勢骨架和人物計數 ID)
-    if detection_result.pose_landmarks:
-        for idx, landmarks in enumerate(detection_result.pose_landmarks):
-            # 1. 繪製姿勢骨架 (MediaPipe 的主要輸出)
-            mp_drawing.draw_landmarks(
-                frame,
-                landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                drawing_styles,
-                drawing_styles
-            )
+            for box, track_id in zip(boxes, track_ids):
+                x1, y1, x2, y2 = box
+                color = (0, 255, 0)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            # 2. 標註人物 ID (使用當前幀中的偵測順序作為 ID)
-            # 注意: 此 ID (idx) 是每一幀中偵測到的順序，而非像 ByteTrack 那樣的持續性追蹤 ID。
-            # MediaPipe 在 VIDEO 模式下會盡力維持個體追蹤，但不會在結果中明確提供 track_id 欄位。
+    # 繪製 FPS 資訊到幀上
+    # 只顯示整體 FPS
+    cv2.putText(frame, f"FPS: {processing_fps:.2f}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-            # 找出近似的 Bounding Box 頂點 (從所有地標中計算 min/max 座標)
-            # 由於地標座標是歸一化的 (0到1)，需要乘上寬高來得到像素值
-            x_min = min([lm.x * width for lm in landmarks])
-            y_min = min([lm.y * height for lm in landmarks])
+    if out.isOpened():
+         out.write(frame)
 
-            # 在頭部上方標註 ID
-            cv2.putText(
-                frame,
-                f"Person ID: {idx + 1}",
-                (int(x_min), int(y_min) - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
-
-    # 將處理後的幀寫入新的影片檔案
-    out.write(frame)
     frame_count += 1
 
-# 步驟 6: 釋放資源並計算總 FPS
+    # 顯示進度
+    if frame_count % 100 == 0:
+        print(f"  處理進度: 已處理 {frame_count} 幀. 當前 FPS: {processing_fps:.2f}")
+
+# --- 資源釋放與總結 FPS ---
 cap.release()
-out.release()
-# 關閉 Landmarker 釋放模型資源
-landmarker.close()
+if out.isOpened():
+    out.release()
+    print(f"\n✅ 輸出影片已成功寫入 Colab 暫存空間: {output_path}")
 
-end_time = time.time()
-total_time = end_time - start_time
-actual_fps = frame_count / total_time
+total_end_time = time.time()
+total_time = total_end_time - total_start_time
 
-print(f"🏁 影片處理完成！總幀數: {frame_count}")
-print(f"總耗時: {total_time:.2f} 秒")
-print(f"平均處理 FPS: {actual_fps:.2f} FPS")
-print(f"✅ 處理後的影片已儲存為 {output_path}，請下載檔案！")
+if frame_count > 0:
+    average_fps = frame_count / total_time
+    print("\n-------------------------------------------------")
+    print(f"總幀數: {frame_count}")
+    print(f"總耗時: {total_time:.2f} 秒")
+    print(f"🚀 **平均處理 FPS: {average_fps:.2f} FPS**")
+    print("-------------------------------------------------")
+else:
+    print("❌ 影片處理失敗，無法計算平均 FPS。")
+
+
+# =========================================================
+# 步驟 3: 下載輸出檔案
+# =========================================================
+print("\n--- 步驟 3/3: 下載輸出檔案 ---")
+if os.path.exists(output_path):
+    print(f"正在將 '{output_path}' 下載到您的電腦...")
+    files.download(output_path)
+    print("✅ 下載完成！請檢查您的下載資料夾。")
+else:
+    print("❌ 輸出檔案不存在，下載失敗。")
+
+print("\n🎉 程式所有步驟執行完畢。")
